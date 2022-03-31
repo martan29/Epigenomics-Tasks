@@ -1,0 +1,275 @@
+##########################
+## EN‐TEx ATAC‐seq data ##
+##########################
+
+## Create a folder and move into it.
+mkdir ATAC-seq
+cd ATAC-seq
+
+## Get link metadata and search for each field. See the header.
+../bin/download.metadata.sh "https://www.encodeproject.org/metadata/?replicates.library.biosample.donor.uuid=d370683e-81e7-473f-8475-7716d027849b&status=released&status=submitted&status=in+progress&assay_slims=DNA+accessibility&assay_title=ATAC-seq&biosample_ontology.term_name=stomach&biosample_ontology.term_name=sigmoid+colon&type=Experiment"
+head -1 metadata.tsv | awk 'BEGIN{FS=OFS="\t"}{for (i=1;i<=NF;i++){print $i, i}}'
+
+	## Download peak calling ##
+
+## Create a folder for analysis and data.
+mkdir analysis 
+mkdir data/bigBed.files
+
+## Check the files of interest and save them.
+cd analysis
+grep -F ATAC-seq ../metadata.tsv |\
+grep -F "bigBed_narrowPeak" |\
+grep -F "pseudoreplicated_peaks" |\
+grep -F "GRCh38" |\
+awk 'BEGIN{FS=OFS="\t"}{print $1, $11, $23}' |\
+sort -k2,2 -k1,1r |\
+sort -k2,2 -u > bigBed.peaks.ids.txt
+
+## Download the file from the link.
+cut -f1 analysis/bigBed.peaks.ids.txt |\
+while read filename; do
+  wget -P data/bigBed.files "https://www.encodeproject.org/files/$filename/@@download/$filename.bigBed"
+done
+
+## Create a file with the md5sum ash code of the files to verify their integrity.
+../bin/selectRows.sh <(cut -f1 analysis/bigBed.peaks.ids.txt) metadata.tsv | cut -f1,46 > data/bigBed.files/md5sum.txt
+
+## Calculate MD5 hash of downloaded files.
+cat data/bigBed.files/md5sum.txt |\
+while read filename original_md5sum; do 
+  md5sum data/bigBed.files/"$filename".bigBed |\
+  awk -v filename="$filename" -v original_md5sum="$original_md5sum" 'BEGIN{FS=" "; OFS="\t"}{print filename, original_md5sum, $1}' 
+done > tmp 
+mv tmp data/bigBed.files/md5sum.txt
+
+## Make sure that there are no files whose original and calculated MD5 hashes differ. We get no output, so it is correct.
+awk '$2!=$3' data/bigBed.files/md5sum.txt
+
+	## Annotation ##
+
+## Create a folder for the annotation and get the annotation from the web from the link.
+mkdir annotation
+wget -P annotation "https://www.encodeproject.org/files/gencode.v24.primary_assembly.annotation/@@download/gencode.v24.primary_assembly.annotation.gtf.gz"
+
+## Uncopress the gtf.gz file.
+gunzip annotation/gencode.v24.primary_assembly.annotation.gtf.gz
+
+## Explore the gtf file.
+less annotation/gencode.v24.primary_assembly.annotation.gtf
+
+## Convert the gtf annotation file to a BED format for:
+	# retrieve gene body coordinates of protein-coding genes (chr, start, end, strand).
+	# remove mitochondrial genes (i.e. those located on chrM).
+	# move from a 1-based to a 0-based coordinate system.
+awk '$3=="gene"' annotation/gencode.v24.primary_assembly.annotation.gtf |\
+grep -F "protein_coding" |\
+cut -d ";" -f1 |\
+awk 'BEGIN{OFS="\t"}{print $1, $4, $5, $10, 0, $7, $10}' |\
+sed 's/\"//g' |\
+awk 'BEGIN{FS=OFS="\t"}$1!="chrM"{$2=($2-1); print $0}' > annotation/gencode.v24.protein.coding.gene.body.bed 
+
+## Get the file with all TSS from the repository. 
+wget -P annotation/ "https://public-docs.crg.es/rguigo/Data/bborsari/UVIC/epigenomics_course/gencode.v24.protein.coding.non.redundant.TSS.bed"
+
+## Create a folder for bed files.
+mkdir data/bed.files
+
+## Convert .bigBed to .bed files.
+cut -f1 analysis/bigBed.peaks.ids.txt |\
+while read filename; do
+  bigBedToBed data/bigBed.files/"$filename".bigBed data/bed.files/"$filename".bed
+done
+
+## Intersect the peaks and the no redundant TSS.
+cut -f-2 analysis/bigBed.peaks.ids.txt |\
+while read filename tissue; do 
+  bedtools intersect -wa -a data/bed.files/"$filename".bed -b annotation/gencode.v24.protein.coding.non.redundant.TSS.bed |\
+  sort -u > analysis/promoters.peaks."$tissue".ATAC-seq.bed
+done
+
+
+####-wa serves to ensure that the original peak reported by the ATAC-seq assay is preserved.
+
+## Count the rows of the output files, since each of them is an overlapping peak.
+cut -f2 analysis/bigBed.peaks.ids.txt |\
+while read tissue; do
+  wc -l analysis/promoters.peaks."$tissue".ATAC-seq.bed
+done
+		### RESULTS:
+		### 38071 sigmoid_colon
+		### 33169 stomach
+
+## Find the intersection of the outer peaks with the regions of the gene body. 
+cut -f-2 analysis/bigBed.peaks.ids.txt |\
+while read filename tissue; do 
+  bedtools intersect -v -a data/bed.files/"$filename".bed -b annotation/gencode.v24.protein.coding.gene.body.bed |\
+  sort -u > analysis/non.gene.peaks."$tissue".ATAC-seq.bed
+done
+
+## Count the rows of the output files, since each of them is an overlapping peak.
+cut -f2 analysis/bigBed.peaks.ids.txt |\
+while read tissue; do
+  wc -l analysis/non.gene.peaks."$tissue".ATAC-seq.bed
+done
+		### RESULTS:
+		### 16865 sigmoid_colon
+		### 15762 stomach
+
+
+#######################
+## Distal regulatory ##
+#######################
+
+	# Task 1 #
+
+## Create regulatory_elements folder.
+mkdir regulatory_elements
+
+	# Task 2 #
+
+## Create data folder.
+mkdir data/bigBed.files/H3K27ac
+mkdir data/bigBed.files/H3K4me1
+
+## Move previous metadata file to its folder.
+mv ATAC-seq/metadata.tsv regulatory_elements
+
+## Download data for H3K27ac modifications.
+grep -F H3K27ac ../ChIP-seq/metadata.tsv |\
+grep -F "bigBed_narrowPeak" |\
+grep -F "pseudoreplicated_peaks" |\
+grep -F "GRCh38" |\
+awk 'BEGIN{FS=OFS="\t"}{print $1, $11, $23}' |\
+sort -k2,2 -k1,1r |\
+sort -k2,2 -u > analysis/bigBed.peaksH3K27ac.ids.txt
+
+cut -f1 analysis/bigBed.peaksH3K27ac.ids.txt |\
+while read filename; do
+  wget -P data/bigBed.files/H3K27ac "https://www.encodeproject.org/files/$filename/@@download/$filename.bigBed"
+done
+
+## Download data for H3K4me1 modifications.
+grep -F H3K4me1 ../ChIP-seq/metadata.tsv |\
+grep -F "bigBed_narrowPeak" |\
+grep -F "pseudoreplicated_peaks" |\
+grep -F "GRCh38" |\
+awk 'BEGIN{FS=OFS="\t"}{print $1, $11, $23}' |\
+sort -k2,2 -k1,1r |\
+sort -k2,2 -u > analysis/bigBed.peaksH3K4me1.ids.txt
+
+cut -f1 analysis/bigBed.peaksH3K4me1.ids.txt |\
+while read filename; do
+  wget -P data/bigBed.files/H3K4me1 "https://www.encodeproject.org/files/$filename/@@download/$filename.bigBed"
+done
+
+## Create a folder for acetylation and a folder for methylation.
+mkdir data/bed.files/
+mkdir data/bed.files/H3K4me1
+mkdir data/bed.files/H3K27ac
+
+## Acetylation (H3K27ac)
+cut -f1 analysis/bigBed.peaksH3K27ac.ids.txt |\
+while read filename; do
+  bigBedToBed data/bigBed.files/H3K27ac/"$filename".bigBed data/bed.files/H3K27ac/"$filename".bed
+done
+
+## Methylation (H3K4me1)
+cut -f1 analysis/bigBed.peaksH3K4me1.ids.txt |\
+while read filename; do
+  bigBedToBed data/bigBed.files/H3K4me1/"$filename".bigBed data/bed.files/H3K4me1/"$filename".bed
+done
+
+## Intersect ATAC-sec peaks with methylation and acetylation peaks.
+
+	## For H3K27ac:
+bedtools intersect -a ../ATAC-seq/analysis/non.gene.peaks.sigmoid_colon.ATAC-seq.bed -b data/bed.files/H3K27ac/ENCFF872UHN.bed -u > data/bed.files/H3K27ac/intersect_sigmoid.bed
+
+bedtools intersect -a ../ATAC-seq/analysis/non.gene.peaks.stomach.ATAC-seq.bed -b data/bed.files/H3K27ac/ENCFF977LBD.bed -u > data/bed.files/H3K27ac/intersect_stomach.bed
+
+	## For H3K4me1:
+bedtools intersect -a ../ATAC-seq/analysis/non.gene.peaks.sigmoid_colon.ATAC-seq.bed -b data/bed.files/H3K4me1/ENCFF724ZOF.bed -u > data/bed.files/H3K4me1/intersect_sigmoid.bed
+
+bedtools intersect -a ../ATAC-seq/analysis/non.gene.peaks.stomach.ATAC-seq.bed -b data/bed.files/H3K4me1/ENCFF844XRN.bed -u > data/bed.files/H3K4me1/intersect_stomach.bed
+
+	## For tissues:
+bedtools intersect -a data/bed.files/H3K4me1/intersect_stomach.bed -b data/bed.files/H3K27ac/intersect_stomach.bed -u > data/total_stomach.bed
+
+bedtools intersect -a data/bed.files/H3K4me1/intersect_sigmoid.bed -b data/bed.files/H3K27ac/intersect_sigmoid.bed -u > data/total_sigmoid.bed
+
+## Count the lines to find out how many candidate distal regulatory elements for each tissue.
+wc -l *.bed
+
+		### RESULTS:
+		### 14215 candidates in sigmoid tissue.
+   	### 8022 candidates in stomach tissue. 
+
+	# Task 3 #
+
+## Create folder for peaks found in chr1.
+mkdir chr1
+
+## Select the peaks found in chr1 for sigmoid tissue.
+grep -w chr1 data/total_sigmoid.bed |\
+awk '{print $4 "\t" $2}' > chr1/sigmoid.regulatory.elements.starts.tsv
+
+## Select the peaks found in chr1 for stomach tissue.
+grep -w chr1 data/total_stomach.bed |\
+awk '{print $4 "\t" $2}' > chr1/stomach.regulatory.elements.starts.tsv
+
+		### RESULTS:
+		### 1521 regulatory elements on chr1 of the sigmoid tissue
+   	### 987 regulatory elements on chr1 of the stomach tissue
+
+	# Task 4 #
+
+## Create file that in col1: gene name and col2: start coordinate.
+grep -w chr1 ../ATAC-seq/annotation/gencode.v24.protein.coding.gene.body.bed| awk 'BEGIN{FS=OFS="\t"}{if ($6=="+"){start=$2} else {start=$3}; print $4, start}' > gene.start.tsv
+
+## View file header.
+head gene.start.tsv
+
+	# Task 5 #
+
+## Copy the code provided in the link.
+nano get.distance.py
+
+## Lines added in Python code:
+####################
+####################
+position = int(y) 
+diff = abs(position - enhancer_start) 
+if diff < x:
+        x = diff
+	selectedGene = gene
+	selectedGeneStart = position
+####################
+####################
+
+
+## Ensure that the script works properly.
+python ../bin/get.distance.py --input gene.start.tsv --start 980000
+
+	# Task 6 #
+
+## Retrieve the nearest gene and the distance to the nearest gene with the Python script.
+cd ..
+
+for tissue in stomach sigmoid; do
+  cat regulatory_elements/chr1/"$tissue".regulatory.elements.starts.tsv | while read element start; do 
+   python bin/get.distance.py --input regulatory_elements/gene.start.tsv --start "$start"
+  done > regulatory_elements/chr1/"$tissue".regulatory.elements.genes.distances.tsv
+done
+
+	# Task 7 #
+
+## Calculate the mean and median distances using R.
+for tissue in stomach sigmoid; do
+  cut -f3 regulatory_elements/chr1/"$tissue".regulatory.elements.genes.distances.tsv > tmp ;\
+  Rscript -e 'dis <- read.table("tmp")' -e '(mean(t(dis)))' -e '(median(t(dis)))' 
+done
+		### RESULTS:
+		### Mean distance for stomach: 45227.05
+		### Mean distance for sigmoi: 73635.89
+		### Median distance for stomach: 27735
+		### Median distance for sigmoi: 35802
